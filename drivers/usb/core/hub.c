@@ -2394,18 +2394,6 @@ static int hub_port_reset(struct usb_hub *hub, int port1,
 		 * Some companion controllers don't like it when they mix.
 		 */
 		down_read(&ehci_cf_port_reset_rwsem);
-	} else if (!warm) {
-		/*
-		 * If the caller hasn't explicitly requested a warm reset,
-		 * double check and see if one is needed.
-		 */
-		status = hub_port_status(hub, port1,
-					&portstatus, &portchange);
-		if (status < 0)
-			goto done;
-
-		if (hub_port_warm_reset_required(hub, portstatus))
-			warm = true;
 	}
 
 	/* Reset the port */
