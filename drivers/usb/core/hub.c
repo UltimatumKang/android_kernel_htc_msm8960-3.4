@@ -2305,12 +2305,61 @@ static int hub_port_wait_reset(struct usb_hub *hub, int port1,
 		 * connection may bounce if multiple warm resets were issued,
 		 * but the device may have successfully re-connected. Ignore it.
 		 */
-		if (!hub_is_superspeed(hub->hdev) &&
-				(portchange & USB_PORT_STAT_C_CONNECTION))
-			return -ENOTCONN;
+		if (!warm) {
+			/*
+			 * Some buggy devices can cause an NEC host controller
+			 * to transition to the "Error" state after a hot port
+			 * reset.  This will show up as the port state in
+			 * "Inactive", and the port may also report a
+			 * disconnect.  Forcing a warm port reset seems to make
+			 * the device work.
+			 *
+			 * See https://bugzilla.kernel.org/show_bug.cgi?id=41752
+			 */
+			if (hub_port_warm_reset_required(hub, portstatus)) {
+				int ret;
 
-		if ((portstatus & USB_PORT_STAT_ENABLE)) {
-			if (!udev)
+				if ((portchange & USB_PORT_STAT_C_CONNECTION))
+					clear_port_feature(hub->hdev, port1,
+							USB_PORT_FEAT_C_CONNECTION);
+				if (portchange & USB_PORT_STAT_C_LINK_STATE)
+					clear_port_feature(hub->hdev, port1,
+							USB_PORT_FEAT_C_PORT_LINK_STATE);
+				if (portchange & USB_PORT_STAT_C_RESET)
+					clear_port_feature(hub->hdev, port1,
+							USB_PORT_FEAT_C_RESET);
+				dev_dbg(hub->intfdev, "hot reset failed, warm reset port %d\n",
+						port1);
+				ret = hub_port_reset(hub, port1,
+						udev, HUB_BH_RESET_TIME,
+						true);
+				if ((portchange & USB_PORT_STAT_C_CONNECTION))
+					clear_port_feature(hub->hdev, port1,
+							USB_PORT_FEAT_C_CONNECTION);
+				return ret;
+			}
+			/* Device went away? */
+			if (!(portstatus & USB_PORT_STAT_CONNECTION))
+				return -ENOTCONN;
+
+			/* bomb out completely if the connection bounced */
+			if ((portchange & USB_PORT_STAT_C_CONNECTION))
+				return -ENOTCONN;
+
+			if ((portstatus & USB_PORT_STAT_ENABLE)) {
+				if (!udev)
+					return 0;
+
+				if (hub_is_wusb(hub))
+					udev->speed = USB_SPEED_WIRELESS;
+				else if (hub_is_superspeed(hub->hdev))
+					udev->speed = USB_SPEED_SUPER;
+				else if (portstatus & USB_PORT_STAT_HIGH_SPEED)
+					udev->speed = USB_SPEED_HIGH;
+				else if (portstatus & USB_PORT_STAT_LOW_SPEED)
+					udev->speed = USB_SPEED_LOW;
+				else
+					udev->speed = USB_SPEED_FULL;
 				return 0;
 
 			if (hub_is_wusb(hub))
@@ -2344,17 +2393,19 @@ static void hub_port_finish_reset(struct usb_hub *hub, int port1,
 {
 	switch (*status) {
 	case 0:
-		/* TRSTRCY = 10 ms; plus some extra */
-		msleep(10 + 40);
-		if (udev) {
-			struct usb_hcd *hcd = bus_to_hcd(udev->bus);
-
-			update_devnum(udev, 0);
-			/* The xHC may think the device is already reset,
-			 * so ignore the status.
-			 */
-			if (hcd->driver->reset_device)
-				hcd->driver->reset_device(hcd, udev);
+		if (!warm) {
+			struct usb_hcd *hcd;
+			/* TRSTRCY = 10 ms; plus some extra */
+			msleep(10 + 40);
+			if (udev) {
+				update_devnum(udev, 0);
+				hcd = bus_to_hcd(udev->bus);
+				/* The xHC may think the device is already
+				 * reset, so ignore the status.
+				 */
+				if (hcd->driver->reset_device)
+					hcd->driver->reset_device(hcd, udev);
+			}
 		}
 		/* FALL THROUGH */
 	case -ENOTCONN:
@@ -2369,7 +2420,7 @@ static void hub_port_finish_reset(struct usb_hub *hub, int port1,
 			clear_port_feature(hub->hdev, port1,
 					USB_PORT_FEAT_C_CONNECTION);
 		}
-		if (udev)
+		if (!warm && udev)
 			usb_set_device_state(udev, *status
 					? USB_STATE_NOTATTACHED
 					: USB_STATE_DEFAULT);
