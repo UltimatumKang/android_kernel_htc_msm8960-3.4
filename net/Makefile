@@ -4,7 +4,9 @@
 # 2 Sep 2000, Christoph Hellwig <hch@infradead.org>
 # Rewritten to use lists instead of if-statements.
 #
-
+ifdef CONFIG_CC_OPTIMIZE_FOR_PERF
+CFLAGS_socket.o += -O2
+endif
 obj-y	:= nonet.o
 
 obj-$(CONFIG_NET)		:= socket.o core/
