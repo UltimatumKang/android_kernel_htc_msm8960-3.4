@@ -1,6 +1,6 @@
 #
 # Automatically generated file; DO NOT EDIT.
-# Linux/arm 3.4.36 Kernel Configuration
+# Linux/arm 3.4.38 Kernel Configuration
 #
 CONFIG_ARM=y
 CONFIG_ARM_HAS_SG_CHAIN=y
@@ -51,6 +51,7 @@ CONFIG_KERNEL_XZ=y
 # CONFIG_KERNEL_LZO is not set
 CONFIG_DEFAULT_HOSTNAME="(none)"
 CONFIG_SWAP=y
+CONFIG_FRONTSWAP=y
 CONFIG_SYSVIPC=y
 CONFIG_SYSVIPC_SYSCTL=y
 # CONFIG_POSIX_MQUEUE is not set
@@ -2559,7 +2560,7 @@ CONFIG_HID_SUPPORT=y
 CONFIG_HID=y
 # CONFIG_HID_BATTERY_STRENGTH is not set
 # CONFIG_HIDRAW is not set
-# CONFIG_UHID is not set
+CONFIG_UHID=y
 
 #
 # USB Input Devices
@@ -2981,7 +2982,11 @@ CONFIG_STAGING=y
 # CONFIG_LINE6_USB is not set
 # CONFIG_VT6656 is not set
 # CONFIG_IIO is not set
-CONFIG_QCACHE=y
+# CONFIG_QCACHE is not set
+CONFIG_ZCACHE=y
+CONFIG_ZRAM=y
+CONFIG_ZRAM_FOR_ANDROID=y
+CONFIG_ZSMALLOC=y
 # CONFIG_FB_SM7XX is not set
 # CONFIG_USB_ENESTORAGE is not set
 # CONFIG_BCM_WIMAX is not set
