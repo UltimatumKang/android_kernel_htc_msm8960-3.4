@@ -1,4 +1,4 @@
-/* Copyright (c) 2012, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2012-2013, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -10,7 +10,7 @@
  * GNU General Public License for more details.
  */
 
-#define pr_fmt(fmt) "%s: " fmt, __func__
+#define pr_fmt(fmt) "PDN %s: " fmt, __func__
 
 #include <linux/err.h>
 #include <linux/kernel.h>
@@ -27,6 +27,7 @@
 #include <linux/regulator/machine.h>
 #include <linux/regulator/of_regulator.h>
 #include <linux/regulator/krait-regulator.h>
+#include <mach/msm_iomap.h>
 
 #include "spm.h"
 
@@ -35,19 +36,17 @@
  *                   from
  *                   pmic
  *                   gang
- *                    |        LDO BYP [6]
- *                    |         /
- *                    |        /
- *                    |_______/   _____
- *                    |                |
- *                 ___|___             |
- *		  |       |            |
- *		  |       |               /
- *		  |  LDO  |              /
- *		  |       |             /    BHS[6]
- *                |_______|            |
- *                    |                |
- *                    |________________|
+ *                    |
+ *                    |________________________________
+ *                    |                |               |
+ *                 ___|___             |               |
+ *		  |       |            |               |
+ *		  |       |               /               /
+ *		  |  LDO  |              /               /LDO BYP [6]
+ *		  |       |             /    BHS[6]     /(bypass is a weak BHS
+ *                |_______|            |               |  needs to be on when in
+ *                    |                |               |  BHS mode)
+ *                    |________________|_______________|
  *                    |
  *            ________|________
  *           |                 |
@@ -55,15 +54,9 @@
  *           |_________________|
  */
 
-#define V_RETENTION			600000
-#define V_LDO_HEADROOM			150000
-
 #define PMIC_VOLTAGE_MIN		350000
 #define PMIC_VOLTAGE_MAX		1355000
 #define LV_RANGE_STEP			5000
-
-/* use LDO for core voltage below LDO_THRESH */
-#define CORE_VOLTAGE_LDO_THRESH		750000
 
 #define LOAD_PER_PHASE			3200000
 
@@ -87,6 +80,15 @@
 #define CPU_TRGTD_DBG_RST	0x00000010
 #define APC_PWR_GATE_CTL	0x00000014
 #define APC_LDO_VREF_SET	0x00000018
+#define APC_PWR_GATE_MODE	0x0000001C
+#define APC_PWR_GATE_DLY	0x00000020
+
+#define PWR_GATE_CONFIG		0x00000044
+#define VERSION			0x00000FD0
+
+/* MDD register group */
+#define MDD_CONFIG_CTL		0x00000000
+#define MDD_MODE		0x00000010
 
 /* bit definitions for APC_PWR_GATE_CTL */
 #define BHS_CNT_BIT_POS		24
@@ -135,6 +137,7 @@ struct pmic_gang_vreg {
 	int			pmic_phase_count;
 	struct list_head	krait_power_vregs;
 	struct mutex		krait_power_vregs_lock;
+	bool			pfm_mode;
 };
 
 static struct pmic_gang_vreg *the_gang;
@@ -154,7 +157,15 @@ struct krait_power_vreg {
 	int				load_uA;
 	enum krait_supply_mode		mode;
 	void __iomem			*reg_base;
+	void __iomem			*mdd_base;
+	int				ldo_default_uV;
+	int				retention_uV;
+	int				headroom_uV;
+	int				ldo_threshold_uV;
+	bool				online;
 };
+
+static u32 version;
 
 static void krait_masked_write(struct krait_power_vreg *kvreg,
 					int reg, uint32_t mask, uint32_t val)
@@ -191,11 +202,22 @@ static int get_krait_ldo_uv(struct krait_power_vreg *kvreg)
 	return uV;
 }
 
-static int set_krait_ldo_uv(struct krait_power_vreg *kvreg)
+static int set_krait_retention_uv(struct krait_power_vreg *kvreg, int uV)
 {
 	uint32_t reg_val;
 
-	reg_val = kvreg->uV - KRAIT_LDO_VOLTAGE_OFFSET / KRAIT_LDO_STEP;
+	reg_val = DIV_ROUND_UP(uV - KRAIT_LDO_VOLTAGE_OFFSET, KRAIT_LDO_STEP);
+	krait_masked_write(kvreg, APC_LDO_VREF_SET, VREF_RET_MASK,
+						reg_val << VREF_RET_POS);
+
+	return 0;
+}
+
+static int set_krait_ldo_uv(struct krait_power_vreg *kvreg, int uV)
+{
+	uint32_t reg_val;
+
+	reg_val = DIV_ROUND_UP(uV - KRAIT_LDO_VOLTAGE_OFFSET, KRAIT_LDO_STEP);
 	krait_masked_write(kvreg, APC_LDO_VREF_SET, VREF_LDO_MASK,
 						reg_val << VREF_LDO_BIT_POS);
 
@@ -206,15 +228,13 @@ static int switch_to_using_hs(struct krait_power_vreg *kvreg)
 {
 	if (kvreg->mode == HS_MODE)
 		return 0;
-
-	/*
-	 * enable ldo bypass - the krait is powered still by LDO since
-	 * LDO is enabled and BHS is disabled
-	 */
-	krait_masked_write(kvreg, APC_PWR_GATE_CTL, LDO_BYP_MASK, LDO_BYP_MASK);
-
 	/* enable bhs */
-	krait_masked_write(kvreg, APC_PWR_GATE_CTL, BHS_EN_MASK, BHS_EN_MASK);
+	krait_masked_write(kvreg, APC_PWR_GATE_CTL,
+		BHS_SEG_EN_MASK | BHS_EN_MASK,
+		BHS_SEG_EN_DEFAULT << BHS_SEG_EN_BIT_POS | BHS_EN_MASK);
+
+	/* complete the above write before the delay */
+	mb();
 
 	/*
 	 * wait for the bhs to settle - note that
@@ -223,11 +243,18 @@ static int switch_to_using_hs(struct krait_power_vreg *kvreg)
 	 */
 	udelay(BHS_SETTLING_DELAY_US);
 
+	/*
+	 * enable ldo bypass - the krait is powered still by LDO since
+	 * LDO is enabled
+	 */
+	krait_masked_write(kvreg, APC_PWR_GATE_CTL, LDO_BYP_MASK, LDO_BYP_MASK);
+
 	/* disable ldo - only the BHS provides voltage to the cpu after this */
 	krait_masked_write(kvreg, APC_PWR_GATE_CTL,
 				LDO_PWR_DWN_MASK, LDO_PWR_DWN_MASK);
 
 	kvreg->mode = HS_MODE;
+	pr_debug("%s using BHS\n", kvreg->name);
 	return 0;
 }
 
@@ -243,7 +270,7 @@ static int switch_to_using_ldo(struct krait_power_vreg *kvreg)
 	if (kvreg->mode == LDO_MODE)
 		switch_to_using_hs(kvreg);
 
-	set_krait_ldo_uv(kvreg);
+	set_krait_ldo_uv(kvreg, kvreg->uV);
 
 	/*
 	 * enable ldo - note that both LDO and BHS are are supplying voltage to
@@ -251,6 +278,9 @@ static int switch_to_using_ldo(struct krait_power_vreg *kvreg)
 	 * to LDO.
 	 */
 	krait_masked_write(kvreg, APC_PWR_GATE_CTL, LDO_PWR_DWN_MASK, 0);
+
+	/* complete the writes before the delay */
+	mb();
 
 	/* wait for the ldo to settle */
 	udelay(LDO_SETTLING_DELAY_US);
@@ -261,8 +291,10 @@ static int switch_to_using_ldo(struct krait_power_vreg *kvreg)
 	 */
 	krait_masked_write(kvreg, APC_PWR_GATE_CTL,
 		BHS_EN_MASK | LDO_BYP_MASK, 0);
+	krait_masked_write(kvreg, APC_PWR_GATE_CTL, BHS_SEG_EN_MASK, 0);
 
 	kvreg->mode = LDO_MODE;
+	pr_debug("%s using LDO\n", kvreg->name);
 	return 0;
 }
 
@@ -275,9 +307,15 @@ static int set_pmic_gang_phases(int phase_count)
 	return 0;
 }
 
-static int set_pmic_gang_voltage(int uV)
+static int set_pmic_gang_voltage(struct pmic_gang_vreg *pvreg, int uV)
 {
 	int setpoint;
+	int rc;
+
+	if (pvreg->pmic_vmax_uV == uV)
+		return 0;
+
+	pr_debug("%d\n", uV);
 
 	if (uV < PMIC_VOLTAGE_MIN) {
 		pr_err("requested %d < %d, restricting it to %d\n",
@@ -291,18 +329,28 @@ static int set_pmic_gang_voltage(int uV)
 	}
 
 	setpoint = DIV_ROUND_UP(uV, LV_RANGE_STEP);
-	return msm_spm_apcs_set_vdd(setpoint);
+
+	rc = msm_spm_apcs_set_vdd(setpoint);
+	if (rc < 0)
+		pr_err("could not set %duV setpt = 0x%x rc = %d\n",
+				uV, setpoint, rc);
+	else
+		pvreg->pmic_vmax_uV = uV;
+
+	return rc;
 }
 
-static int configure_ldo_or_hs(struct krait_power_vreg *from, int vmax)
+static int configure_ldo_or_hs_all(struct krait_power_vreg *from, int vmax)
 {
 	struct pmic_gang_vreg *pvreg = from->pvreg;
 	struct krait_power_vreg *kvreg;
 	int rc = 0;
 
 	list_for_each_entry(kvreg, &pvreg->krait_power_vregs, link) {
-		if (kvreg->uV > CORE_VOLTAGE_LDO_THRESH
-			 || kvreg->uV > vmax - V_LDO_HEADROOM) {
+		if (!kvreg->online)
+			continue;
+		if (kvreg->uV > kvreg->ldo_threshold_uV
+			 || kvreg->uV > vmax - kvreg->headroom_uV) {
 			rc = switch_to_using_hs(kvreg);
 			if (rc < 0) {
 				pr_err("could not switch %s to hs rc = %d\n",
@@ -323,7 +371,7 @@ static int configure_ldo_or_hs(struct krait_power_vreg *from, int vmax)
 }
 
 #define SLEW_RATE 2994
-static int pmic_gang_set_voltage_increase(struct krait_power_vreg *from,
+static int krait_voltage_increase(struct krait_power_vreg *from,
 							int vmax)
 {
 	struct pmic_gang_vreg *pvreg = from->pvreg;
@@ -331,20 +379,25 @@ static int pmic_gang_set_voltage_increase(struct krait_power_vreg *from,
 	int settling_us;
 
 	/*
-	 * since pmic gang voltage is increasing set the gang voltage
+	 * since krait voltage is increasing set the gang voltage
 	 * prior to changing ldo/hs states of the requesting krait
 	 */
-	rc = set_pmic_gang_voltage(vmax);
+	rc = set_pmic_gang_voltage(pvreg, vmax);
 	if (rc < 0) {
 		dev_err(&from->rdev->dev, "%s failed set voltage %d rc = %d\n",
 				pvreg->name, vmax, rc);
+		return rc;
 	}
+
+
+	/* complete the above writes before the delay */
+	mb();
 
 	/* delay until the voltage is settled when it is raised */
 	settling_us = DIV_ROUND_UP(vmax - pvreg->pmic_vmax_uV, SLEW_RATE);
 	udelay(settling_us);
 
-	rc = configure_ldo_or_hs(from, vmax);
+	rc = configure_ldo_or_hs_all(from, vmax);
 	if (rc < 0) {
 		dev_err(&from->rdev->dev, "%s failed ldo/hs conf %d rc = %d\n",
 				pvreg->name, vmax, rc);
@@ -353,44 +406,31 @@ static int pmic_gang_set_voltage_increase(struct krait_power_vreg *from,
 	return rc;
 }
 
-static int pmic_gang_set_voltage_decrease(struct krait_power_vreg *from,
+static int krait_voltage_decrease(struct krait_power_vreg *from,
 							int vmax)
 {
 	struct pmic_gang_vreg *pvreg = from->pvreg;
 	int rc = 0;
 
 	/*
-	 * since pmic gang voltage is decreasing ldos might get out of their
+	 * since krait voltage is decreasing ldos might get out of their
 	 * operating range. Hence configure such kraits to be in hs mode prior
 	 * to setting the pmic gang voltage
 	 */
-	rc = configure_ldo_or_hs(from, vmax);
+	rc = configure_ldo_or_hs_all(from, vmax);
 	if (rc < 0) {
 		dev_err(&from->rdev->dev, "%s failed ldo/hs conf %d rc = %d\n",
 				pvreg->name, vmax, rc);
 		return rc;
 	}
 
-	rc = set_pmic_gang_voltage(vmax);
+	rc = set_pmic_gang_voltage(pvreg, vmax);
 	if (rc < 0) {
 		dev_err(&from->rdev->dev, "%s failed set voltage %d rc = %d\n",
 				pvreg->name, vmax, rc);
 	}
 
 	return rc;
-}
-
-static int pmic_gang_set_voltage(struct krait_power_vreg *from,
-				 int vmax)
-{
-	struct pmic_gang_vreg *pvreg = from->pvreg;
-
-	if (pvreg->pmic_vmax_uV == vmax)
-		return 0;
-	else if (vmax < pvreg->pmic_vmax_uV)
-		return pmic_gang_set_voltage_decrease(from, vmax);
-
-	return pmic_gang_set_voltage_increase(from, vmax);
 }
 
 #define PHASE_SETTLING_TIME_US		10
@@ -413,6 +453,9 @@ static unsigned int pmic_gang_set_phases(struct krait_power_vreg *from,
 			return rc;
 		}
 
+		/* complete the writes before the delay */
+		mb();
+
 		/*
 		 * delay until the phases are settled when
 		 * the count is raised
@@ -425,7 +468,7 @@ static unsigned int pmic_gang_set_phases(struct krait_power_vreg *from,
 	return rc;
 }
 
-static int __init pvreg_init(struct platform_device *pdev)
+static int __devinit pvreg_init(struct platform_device *pdev)
 {
 	struct pmic_gang_vreg *pvreg;
 
@@ -456,22 +499,22 @@ static int krait_power_get_voltage(struct regulator_dev *rdev)
 	return kvreg->uV;
 }
 
-static int get_vmax(struct krait_power_vreg *from, int min_uV)
+static int get_vmax(struct pmic_gang_vreg *pvreg)
 {
 	int vmax = 0;
 	int v;
 	struct krait_power_vreg *kvreg;
-	struct pmic_gang_vreg *pvreg = from->pvreg;
 
 	list_for_each_entry(kvreg, &pvreg->krait_power_vregs, link) {
-		v = kvreg->uV;
+		if (!kvreg->online)
+			continue;
 
-		if (kvreg == from)
-			v = min_uV;
+		v = kvreg->uV;
 
 		if (vmax < v)
 			vmax = v;
 	}
+
 	return vmax;
 }
 
@@ -481,73 +524,119 @@ static int get_total_load(struct krait_power_vreg *from)
 	struct krait_power_vreg *kvreg;
 	struct pmic_gang_vreg *pvreg = from->pvreg;
 
-	list_for_each_entry(kvreg, &pvreg->krait_power_vregs, link)
+	list_for_each_entry(kvreg, &pvreg->krait_power_vregs, link) {
+		if (!kvreg->online)
+			continue;
 		load_total += kvreg->load_uA;
+	}
 
 	return load_total;
 }
 
 #define ROUND_UP_VOLTAGE(v, res) (DIV_ROUND_UP(v, res) * res)
-static int krait_power_set_voltage(struct regulator_dev *rdev,
-			int min_uV, int max_uV, unsigned *selector)
+static int _set_voltage(struct regulator_dev *rdev,
+			int orig_krait_uV, int requested_uV)
 {
 	struct krait_power_vreg *kvreg = rdev_get_drvdata(rdev);
 	struct pmic_gang_vreg *pvreg = kvreg->pvreg;
 	int rc;
 	int vmax;
 
+	pr_debug("%s: %d to %d\n", kvreg->name, orig_krait_uV, requested_uV);
+	/*
+	 * Assign the voltage before updating the gang voltage as we iterate
+	 * over all the core voltages and choose HS or LDO for each of them
+	 */
+	kvreg->uV = requested_uV;
+
+	vmax = get_vmax(pvreg);
+
+	/* round up the pmic voltage as per its resolution */
+	vmax = ROUND_UP_VOLTAGE(vmax, LV_RANGE_STEP);
+
+	if (requested_uV > orig_krait_uV)
+		rc = krait_voltage_increase(kvreg, vmax);
+	else
+		rc = krait_voltage_decrease(kvreg, vmax);
+
+	if (rc < 0) {
+		dev_err(&rdev->dev, "%s failed to set %duV from %duV rc = %d\n",
+				kvreg->name, requested_uV, orig_krait_uV, rc);
+	}
+
+	return rc;
+}
+
+static int krait_power_set_voltage(struct regulator_dev *rdev,
+			int min_uV, int max_uV, unsigned *selector)
+{
+	struct krait_power_vreg *kvreg = rdev_get_drvdata(rdev);
+	struct pmic_gang_vreg *pvreg = kvreg->pvreg;
+	int rc;
+
 	/*
 	 * if the voltage requested is below LDO_THRESHOLD this cpu could
 	 * switch to LDO mode. Hence round the voltage as per the LDO
 	 * resolution
 	 */
-	if (min_uV < CORE_VOLTAGE_LDO_THRESH) {
+	if (min_uV < kvreg->ldo_threshold_uV) {
 		if (min_uV < KRAIT_LDO_VOLTAGE_MIN)
 			min_uV = KRAIT_LDO_VOLTAGE_MIN;
 		min_uV = ROUND_UP_VOLTAGE(min_uV, KRAIT_LDO_STEP);
 	}
 
 	mutex_lock(&pvreg->krait_power_vregs_lock);
-
-	vmax = get_vmax(kvreg, min_uV);
-
-	/* round up the pmic voltage as per its resolution */
-	vmax = ROUND_UP_VOLTAGE(vmax, LV_RANGE_STEP);
-
-	/*
-	 * Assign the voltage before updating the gang voltage as we iterate
-	 * over all the core voltages and choose HS or LDO for each of them
-	 */
-	kvreg->uV = min_uV;
-
-	rc = pmic_gang_set_voltage(kvreg, vmax);
-	if (rc < 0) {
-		dev_err(&rdev->dev, "%s failed set voltage (%d, %d) rc = %d\n",
-				kvreg->name, min_uV, max_uV, rc);
-		goto out;
+	if (!kvreg->online) {
+		kvreg->uV = min_uV;
+		mutex_unlock(&pvreg->krait_power_vregs_lock);
+		return 0;
 	}
 
-	pvreg->pmic_vmax_uV = vmax;
-
-out:
+	rc = _set_voltage(rdev, kvreg->uV, min_uV);
 	mutex_unlock(&pvreg->krait_power_vregs_lock);
+
 	return rc;
 }
 
-static unsigned int krait_power_get_optimum_mode(struct regulator_dev *rdev,
+#define PMIC_FTS_MODE_PFM	0x00
+#define PMIC_FTS_MODE_PWM	0x80
+#define PFM_LOAD_UA		500000
+static unsigned int _get_optimum_mode(struct regulator_dev *rdev,
 			int input_uV, int output_uV, int load_uA)
 {
 	struct krait_power_vreg *kvreg = rdev_get_drvdata(rdev);
 	struct pmic_gang_vreg *pvreg = kvreg->pvreg;
 	int rc;
 	int load_total_uA;
-	int reg_mode = -EINVAL;
-
-	mutex_lock(&pvreg->krait_power_vregs_lock);
-
-	kvreg->load_uA = load_uA;
 
 	load_total_uA = get_total_load(kvreg);
+
+	if (load_total_uA < PFM_LOAD_UA) {
+		if (!pvreg->pfm_mode) {
+			rc = msm_spm_enable_fts_lpm(PMIC_FTS_MODE_PFM);
+			if (rc) {
+				dev_err(&rdev->dev,
+					"%s enter PFM failed load %d rc = %d\n",
+					kvreg->name, load_total_uA, rc);
+				goto out;
+			} else {
+				pvreg->pfm_mode = true;
+			}
+		}
+		return kvreg->mode;
+	}
+
+	if (pvreg->pfm_mode) {
+		rc = msm_spm_enable_fts_lpm(PMIC_FTS_MODE_PWM);
+		if (rc) {
+			dev_err(&rdev->dev,
+				"%s exit PFM failed load %d rc = %d\n",
+				kvreg->name, load_total_uA, rc);
+			goto out;
+		} else {
+			pvreg->pfm_mode = false;
+		}
+	}
 
 	rc = pmic_gang_set_phases(kvreg, load_total_uA);
 	if (rc < 0) {
@@ -556,10 +645,28 @@ static unsigned int krait_power_get_optimum_mode(struct regulator_dev *rdev,
 		goto out;
 	}
 
-	reg_mode = kvreg->mode;
 out:
+	return kvreg->mode;
+}
+
+static unsigned int krait_power_get_optimum_mode(struct regulator_dev *rdev,
+			int input_uV, int output_uV, int load_uA)
+{
+	struct krait_power_vreg *kvreg = rdev_get_drvdata(rdev);
+	struct pmic_gang_vreg *pvreg = kvreg->pvreg;
+	int rc;
+
+	mutex_lock(&pvreg->krait_power_vregs_lock);
+	kvreg->load_uA = load_uA;
+	if (!kvreg->online) {
+		mutex_unlock(&pvreg->krait_power_vregs_lock);
+		return kvreg->mode;
+	}
+
+	rc = _get_optimum_mode(rdev, input_uV, output_uV, load_uA);
 	mutex_unlock(&pvreg->krait_power_vregs_lock);
-	return reg_mode;
+
+	return rc;
 }
 
 static int krait_power_set_mode(struct regulator_dev *rdev, unsigned int mode)
@@ -574,12 +681,63 @@ static unsigned int krait_power_get_mode(struct regulator_dev *rdev)
 	return kvreg->mode;
 }
 
+static int krait_power_is_enabled(struct regulator_dev *rdev)
+{
+	struct krait_power_vreg *kvreg = rdev_get_drvdata(rdev);
+
+	return kvreg->online;
+}
+
+static int krait_power_enable(struct regulator_dev *rdev)
+{
+	struct krait_power_vreg *kvreg = rdev_get_drvdata(rdev);
+	struct pmic_gang_vreg *pvreg = kvreg->pvreg;
+	int rc;
+
+	mutex_lock(&pvreg->krait_power_vregs_lock);
+	kvreg->online = true;
+	rc = _get_optimum_mode(rdev, kvreg->uV, kvreg->uV, kvreg->load_uA);
+	if (rc < 0)
+		goto en_err;
+	/*
+	 * since the core is being enabled, behave as if it is increasing
+	 * the core voltage
+	 */
+	rc = _set_voltage(rdev, 0, kvreg->uV);
+en_err:
+	mutex_unlock(&pvreg->krait_power_vregs_lock);
+	return rc;
+}
+
+static int krait_power_disable(struct regulator_dev *rdev)
+{
+	struct krait_power_vreg *kvreg = rdev_get_drvdata(rdev);
+	struct pmic_gang_vreg *pvreg = kvreg->pvreg;
+	int rc;
+
+	mutex_lock(&pvreg->krait_power_vregs_lock);
+	kvreg->online = false;
+
+	rc = _get_optimum_mode(rdev, kvreg->uV, kvreg->uV,
+							kvreg->load_uA);
+	if (rc < 0)
+		goto dis_err;
+
+	rc = _set_voltage(rdev, kvreg->uV, kvreg->uV);
+dis_err:
+	mutex_unlock(&pvreg->krait_power_vregs_lock);
+	return rc;
+}
+
 static struct regulator_ops krait_power_ops = {
 	.get_voltage		= krait_power_get_voltage,
 	.set_voltage		= krait_power_set_voltage,
 	.get_optimum_mode	= krait_power_get_optimum_mode,
 	.set_mode		= krait_power_set_mode,
 	.get_mode		= krait_power_get_mode,
+	.enable			= krait_power_enable,
+	.disable		= krait_power_disable,
+	.is_enabled		= krait_power_is_enabled,
 };
 
 static void kvreg_hw_init(struct krait_power_vreg *kvreg)
@@ -588,23 +746,50 @@ static void kvreg_hw_init(struct krait_power_vreg *kvreg)
 	 * bhs_cnt value sets the ramp-up time from power collapse,
 	 * initialize the ramp up time
 	 */
-	krait_masked_write(kvreg, APC_PWR_GATE_CTL,
-		BHS_CNT_MASK, BHS_CNT_DEFAULT << BHS_CNT_BIT_POS);
+	set_krait_retention_uv(kvreg, kvreg->retention_uV);
+	set_krait_ldo_uv(kvreg, kvreg->ldo_default_uV);
 
-	krait_masked_write(kvreg, APC_PWR_GATE_CTL,
-		CLK_SRC_SEL_MASK, CLK_SRC_DEFAULT << CLK_SRC_SEL_BIT_POS);
-
-	/* BHS has six different segments, turn them all on */
-	krait_masked_write(kvreg, APC_PWR_GATE_CTL,
-		BHS_SEG_EN_MASK, BHS_SEG_EN_DEFAULT << BHS_SEG_EN_BIT_POS);
+	/* setup the bandgap that configures the reference to the LDO */
+	writel_relaxed(0x00000190, kvreg->mdd_base + MDD_CONFIG_CTL);
+	/* Enable MDD */
+	writel_relaxed(0x00000002, kvreg->mdd_base + MDD_MODE);
+	mb();
 }
+
+static void glb_init(struct platform_device *pdev)
+{
+	/* configure bi-modal switch */
+	writel_relaxed(0x0008736E, MSM_APCS_GCC_BASE + PWR_GATE_CONFIG);
+	/* read kpss version */
+	version = readl_relaxed(MSM_APCS_GCC_BASE + VERSION);
+	pr_debug("version= 0x%x\n", version);
+}
+
+static int is_between(int left, int right, int value)
+{
+	if (left >= right && left >= value && value >= right)
+		return 1;
+	if (left <= right && left <= value && value <= right)
+		return 1;
+	return 0;
+}
+
+#define LDO_HDROOM_MIN		50000
+#define LDO_HDROOM_MAX		250000
+
+#define LDO_UV_MIN		465000
+#define LDO_UV_MAX		750000
+
+#define LDO_TH_MIN		600000
+#define LDO_TH_MAX		800000
 
 static int __devinit krait_power_probe(struct platform_device *pdev)
 {
 	struct krait_power_vreg *kvreg;
-	struct resource *res;
+	struct resource *res, *res_mdd;
 	struct regulator_init_data *init_data = pdev->dev.platform_data;
 	int rc = 0;
+	int headroom_uV, retention_uV, ldo_default_uV, ldo_threshold_uV;
 
 	/* Initialize the pmic gang if it hasn't been initialized already */
 	if (the_gang == NULL) {
@@ -614,6 +799,8 @@ static int __devinit krait_power_probe(struct platform_device *pdev)
 				"failed to init pmic gang rc = %d\n", rc);
 			return rc;
 		}
+		/* global initializtion */
+		glb_init(pdev);
 	}
 
 	if (pdev->dev.of_node) {
@@ -627,6 +814,57 @@ static int __devinit krait_power_probe(struct platform_device *pdev)
 			|= REGULATOR_MODE_NORMAL | REGULATOR_MODE_IDLE
 			| REGULATOR_MODE_FAST;
 		init_data->constraints.input_uV = init_data->constraints.max_uV;
+		rc = of_property_read_u32(pdev->dev.of_node,
+					"qcom,headroom-voltage",
+					&headroom_uV);
+		if (rc < 0) {
+			pr_err("headroom-voltage missing rc=%d\n", rc);
+			return rc;
+		}
+		if (!is_between(LDO_HDROOM_MIN, LDO_HDROOM_MAX, headroom_uV)) {
+			pr_err("bad headroom-voltage = %d specified\n",
+					headroom_uV);
+			return -EINVAL;
+		}
+
+		rc = of_property_read_u32(pdev->dev.of_node,
+					"qcom,retention-voltage",
+					&retention_uV);
+		if (rc < 0) {
+			pr_err("retention-voltage missing rc=%d\n", rc);
+			return rc;
+		}
+		if (!is_between(LDO_UV_MIN, LDO_UV_MAX, retention_uV)) {
+			pr_err("bad retention-voltage = %d specified\n",
+					retention_uV);
+			return -EINVAL;
+		}
+
+		rc = of_property_read_u32(pdev->dev.of_node,
+					"qcom,ldo-default-voltage",
+					&ldo_default_uV);
+		if (rc < 0) {
+			pr_err("ldo-default-voltage missing rc=%d\n", rc);
+			return rc;
+		}
+		if (!is_between(LDO_UV_MIN, LDO_UV_MAX, ldo_default_uV)) {
+			pr_err("bad ldo-default-voltage = %d specified\n",
+					ldo_default_uV);
+			return -EINVAL;
+		}
+
+		rc = of_property_read_u32(pdev->dev.of_node,
+					"qcom,ldo-threshold-voltage",
+					&ldo_threshold_uV);
+		if (rc < 0) {
+			pr_err("ldo-threshold-voltage missing rc=%d\n", rc);
+			return rc;
+		}
+		if (!is_between(LDO_TH_MIN, LDO_TH_MAX, ldo_threshold_uV)) {
+			pr_err("bad ldo-threshold-voltage = %d specified\n",
+					ldo_threshold_uV);
+			return -EINVAL;
+		}
 	}
 
 	if (!init_data) {
@@ -640,9 +878,15 @@ static int __devinit krait_power_probe(struct platform_device *pdev)
 		return -EINVAL;
 	}
 
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "acs");
 	if (!res) {
 		dev_err(&pdev->dev, "missing physical register addresses\n");
+		return -EINVAL;
+	}
+
+	res_mdd = platform_get_resource_byname(pdev, IORESOURCE_MEM, "mdd");
+	if (!res_mdd) {
+		dev_err(&pdev->dev, "missing mdd register addresses\n");
 		return -EINVAL;
 	}
 
@@ -656,15 +900,22 @@ static int __devinit krait_power_probe(struct platform_device *pdev)
 	kvreg->reg_base = devm_ioremap(&pdev->dev,
 				res->start, resource_size(res));
 
-	kvreg->pvreg	  = the_gang;
-	kvreg->name	  = init_data->constraints.name;
-	kvreg->desc.name  = kvreg->name;
-	kvreg->desc.ops   = &krait_power_ops;
-	kvreg->desc.type  = REGULATOR_VOLTAGE;
-	kvreg->desc.owner = THIS_MODULE;
-	kvreg->uV	  = CORE_VOLTAGE_MIN;
-	kvreg->mode	  = HS_MODE;
-	kvreg->desc.ops   = &krait_power_ops;
+	kvreg->mdd_base = devm_ioremap(&pdev->dev,
+				res_mdd->start, resource_size(res));
+
+	kvreg->pvreg		= the_gang;
+	kvreg->name		= init_data->constraints.name;
+	kvreg->desc.name	= kvreg->name;
+	kvreg->desc.ops		= &krait_power_ops;
+	kvreg->desc.type	= REGULATOR_VOLTAGE;
+	kvreg->desc.owner	= THIS_MODULE;
+	kvreg->uV		= CORE_VOLTAGE_MIN;
+	kvreg->mode		= HS_MODE;
+	kvreg->desc.ops		= &krait_power_ops;
+	kvreg->headroom_uV	= headroom_uV;
+	kvreg->retention_uV	= retention_uV;
+	kvreg->ldo_default_uV	= ldo_default_uV;
+	kvreg->ldo_threshold_uV = ldo_threshold_uV;
 
 	platform_set_drvdata(pdev, kvreg);
 
@@ -731,23 +982,36 @@ static void __exit krait_power_exit(void)
 {
 	platform_driver_unregister(&krait_power_driver);
 }
-
 module_exit(krait_power_exit);
 
 void secondary_cpu_hs_init(void *base_ptr)
 {
-	/* 605mV retention and 705mV operational voltage */
-	writel_relaxed(0x1C30, base_ptr + APC_LDO_VREF_SET);
-	writel_relaxed(0x430000, base_ptr + 0x20);
-	writel_relaxed(0x21, base_ptr + 0x1C);
-
 	/* Turn on the BHS, turn off LDO Bypass and power down LDO */
-	writel_relaxed(0x403F007F, base_ptr + APC_PWR_GATE_CTL);
+	writel_relaxed(
+		BHS_CNT_DEFAULT << BHS_CNT_BIT_POS
+		| LDO_PWR_DWN_MASK
+		| CLK_SRC_DEFAULT << CLK_SRC_SEL_BIT_POS
+		| BHS_SEG_EN_DEFAULT << BHS_SEG_EN_BIT_POS
+		| BHS_EN_MASK,
+		base_ptr + APC_PWR_GATE_CTL);
+
+	/* complete the above write before the delay */
 	mb();
-	udelay(1);
+
+	/*
+	 * wait for the bhs to settle
+	 */
+	udelay(BHS_SETTLING_DELAY_US);
 
 	/* Finally turn on the bypass so that BHS supplies power */
-	writel_relaxed(0x403F3F7F, base_ptr + APC_PWR_GATE_CTL);
+	writel_relaxed(
+		BHS_CNT_DEFAULT << BHS_CNT_BIT_POS
+		| LDO_PWR_DWN_MASK
+		| CLK_SRC_DEFAULT << CLK_SRC_SEL_BIT_POS
+		| LDO_BYP_MASK
+		| BHS_SEG_EN_DEFAULT << BHS_SEG_EN_BIT_POS
+		| BHS_EN_MASK,
+		base_ptr + APC_PWR_GATE_CTL);
 }
 
 MODULE_LICENSE("GPL v2");
